@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -663,7 +664,18 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	promptPrefix := a.systemPromptPrefix.Get()
 	var instructions strings.Builder
 
-	for _, server := range mcp.GetStates() {
+	// Sort by server name so the assembled system prompt is byte-stable
+	// across turns. Ranging over the state map directly would randomize the
+	// order of MCP instructions and invalidate the prompt cache prefix on
+	// every request.
+	mcpStates := mcp.GetStates()
+	mcpNames := make([]string, 0, len(mcpStates))
+	for name := range mcpStates {
+		mcpNames = append(mcpNames, name)
+	}
+	slices.Sort(mcpNames)
+	for _, name := range mcpNames {
+		server := mcpStates[name]
 		if server.State != mcp.StateConnected {
 			continue
 		}
@@ -786,6 +798,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	a.eventPromptSent(call.SessionID)
 
 	var stepMessages []fantasy.Message
+	var lastBreakdown requestBreakdown
 	var shouldSummarize bool
 	sanitizedToolCalls := make(map[string]bool)
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
@@ -857,8 +870,12 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(promptPrefix)}, prepared.Messages...)
 			}
 
+			breakdown := requestTokenBreakdown(call.SessionID, options.StepNumber, prepared.Messages, prepared.Tools)
+			logRequestTokenBreakdown(breakdown)
+
 			sessionLock.Lock()
 			stepMessages = cloneFantasyMessages(prepared.Messages)
+			lastBreakdown = breakdown
 			sessionLock.Unlock()
 
 			var assistantMsg message.Message
@@ -1027,6 +1044,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 				return getSessionErr
 			}
 			usage, estimated := fallbackStepUsage(stepMessages, stepResult)
+			logStepUsage(lastBreakdown, usage, estimated)
 			a.updateSessionUsage(largeModel, &updatedSession, usage, a.openrouterCost(stepResult.ProviderMetadata), estimated)
 			extractHyperCredits(stepResult.ProviderMetadata)
 			_, sessionErr := a.sessions.Save(ctx, updatedSession)
@@ -1385,6 +1403,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 
 	summaryPromptText := buildSummaryPrompt(currentSession.Todos)
 
+	var summaryBreakdown requestBreakdown
 	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
 		Prompt:          summaryPromptText,
 		Messages:        aiMsgs,
@@ -1399,6 +1418,8 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 			if systemPromptPrefix != "" {
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(systemPromptPrefix)}, prepared.Messages...)
 			}
+			summaryBreakdown = requestTokenBreakdown(sessionID, options.StepNumber, prepared.Messages, nil)
+			logRequestTokenBreakdown(summaryBreakdown)
 			return callContext, prepared, nil
 		},
 		OnReasoningDelta: func(id string, text string) error {
@@ -1437,6 +1458,7 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	}
 
 	summaryMessage.AddFinish(message.FinishReasonEndTurn, "", "")
+	logStepUsage(summaryBreakdown, resp.TotalUsage, usageIsZero(resp.TotalUsage))
 	err = a.messages.Update(genCtx, summaryMessage)
 	if err != nil {
 		return err
